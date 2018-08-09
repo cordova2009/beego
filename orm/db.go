@@ -996,81 +996,84 @@ func (d *dbBase) ReadBatch(q dbQuerier, qs *querySet, mi *modelInfo, cond *Condi
 
 	var cnt int64
 	for rs.Next() {
-		if one && cnt == 0 || !one {
-			if err := rs.Scan(refs...); err != nil {
-				return 0, err
+		// Remove multiple nesting from level 12 to 6
+		if one && cnt != 0 {
+			cnt++
+			continue
+		}
+		if err := rs.Scan(refs...); err != nil {
+			return 0, err
+		}
+
+		elm := reflect.New(mi.addrField.Elem().Type())
+		mind := reflect.Indirect(elm)
+
+		cacheV := make(map[string]*reflect.Value)
+		cacheM := make(map[string]*modelInfo)
+		trefs := refs
+
+		d.setColsValues(mi, &mind, tCols, refs[:len(tCols)], tz)
+		trefs = refs[len(tCols):]
+
+		for _, tbl := range tables.tables {
+			// loop selected tables
+			if !tbl.sel {
+				continue
 			}
-
-			elm := reflect.New(mi.addrField.Elem().Type())
-			mind := reflect.Indirect(elm)
-
-			cacheV := make(map[string]*reflect.Value)
-			cacheM := make(map[string]*modelInfo)
-			trefs := refs
-
-			d.setColsValues(mi, &mind, tCols, refs[:len(tCols)], tz)
-			trefs = refs[len(tCols):]
-
-			for _, tbl := range tables.tables {
-				// loop selected tables
-				if tbl.sel {
-					last := mind
-					names := ""
-					mmi := mi
-					// loop cascade models
-					for _, name := range tbl.names {
-						names += name
-						if val, ok := cacheV[names]; ok {
-							last = *val
-							mmi = cacheM[names]
-						} else {
-							fi := mmi.fields.GetByName(name)
-							lastm := mmi
-							mmi = fi.relModelInfo
-							field := last
-							if last.Kind() != reflect.Invalid {
-								field = reflect.Indirect(last.FieldByIndex(fi.fieldIndex))
-								if field.IsValid() {
-									d.setColsValues(mmi, &field, mmi.fields.dbcols, trefs[:len(mmi.fields.dbcols)], tz)
-									for _, fi := range mmi.fields.fieldsReverse {
-										if fi.inModel && fi.reverseFieldInfo.mi == lastm {
-											if fi.reverseFieldInfo != nil {
-												f := field.FieldByIndex(fi.fieldIndex)
-												if f.Kind() == reflect.Ptr {
-													f.Set(last.Addr())
-												}
-											}
-										}
-									}
-									last = field
-								}
-							}
-							cacheV[names] = &field
-							cacheM[names] = mmi
+			last := mind
+			names := ""
+			mmi := mi
+			// loop cascade models
+			for _, name := range tbl.names {
+				names += name
+				if val, ok := cacheV[names]; ok {
+					last = *val
+					mmi = cacheM[names]
+				} else {
+					fi := mmi.fields.GetByName(name)
+					lastm := mmi
+					mmi = fi.relModelInfo
+					field := last
+					field = reflect.Indirect(last.FieldByIndex(fi.fieldIndex))
+					// Remove if multiple nesting
+					if last.Kind() == reflect.Invalid || field.IsNil() || field.IsValid() {
+						cacheV[names] = &field
+						cacheM[names] = mmi
+						continue
+					}
+					d.setColsValues(mmi, &field, mmi.fields.dbcols, trefs[:len(mmi.fields.dbcols)], tz)
+					for _, fi := range mmi.fields.fieldsReverse {
+						if !fi.inModel || fi.reverseFieldInfo.mi != lastm || fi.reverseFieldInfo == nil {
+							continue
+						}
+						f := field.FieldByIndex(fi.fieldIndex)
+						if f.Kind() == reflect.Ptr {
+							f.Set(last.Addr())
 						}
 					}
-					trefs = trefs[len(mmi.fields.dbcols):]
+					last = field
+					cacheV[names] = &field
+					cacheM[names] = mmi
 				}
 			}
+			trefs = trefs[len(mmi.fields.dbcols):]
+		}
 
-			if one {
-				ind.Set(mind)
+		if one {
+			ind.Set(mind)
+		} else {
+			if cnt == 0 && ind.Len() != 0 {
+				// you can use a empty & caped container list
+				// orm will not replace it
+				// if container is not empty
+				// create a new one
+				slice = reflect.New(ind.Type()).Elem()
+			}
+
+			if isPtr {
+				slice = reflect.Append(slice, mind.Addr())
 			} else {
-				if cnt == 0 {
-					// you can use a empty & caped container list
-					// orm will not replace it
-					if ind.Len() != 0 {
-						// if container is not empty
-						// create a new one
-						slice = reflect.New(ind.Type()).Elem()
-					}
-				}
-
-				if isPtr {
-					slice = reflect.Append(slice, mind.Addr())
-				} else {
-					slice = reflect.Append(slice, mind)
-				}
+				slice = reflect.Append(slice, mind)
 			}
 		}
 		cnt++
@@ -1079,12 +1082,10 @@ func (d *dbBase) ReadBatch(q dbQuerier, qs *querySet, mi *modelInfo, cond *Condi
 	if !one {
 		if cnt > 0 {
 			ind.Set(slice)
-		} else {
+		} else if ind.IsNil() {
 			// when a result is empty and container is nil
 			// to set a empty container
-			if ind.IsNil() {
-				ind.Set(reflect.MakeSlice(ind.Type(), 0, 0))
-			}
+			ind.Set(reflect.MakeSlice(ind.Type(), 0, 0))
 		}
 	}
 
